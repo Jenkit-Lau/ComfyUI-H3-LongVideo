@@ -34,6 +34,12 @@ def inside(root, path):
 
 
 REFERENCE_MIRROR_ROOT = "H3LV"
+# Widget ceiling for max_seconds/target_seconds, aligned with the H3 sampler:
+# its "length" input tops out at 3600 frames, and frames_for(149s) = 3592 frames,
+# still inside that cap. 149s exceeds the model's trained range (~124-362 frames,
+# i.e. ~5-15s), so longer segments cost quality; that is the user's call, not a hard block.
+MAX_SEGMENT_SECONDS = 149.0
+MIN_ANALYSIS_SECONDS = 5.0
 MAX_SEGMENT_REFERENCES = 6
 REFERENCE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 MAX_REFERENCE_BYTES = 32 * 1024 * 1024
@@ -365,8 +371,9 @@ def _sections(lines, starts, active, sr, duration, minimum=2):
 
 
 def segmentation(audio, sr, transcript, mode, maximum, target, mix_audio=None, return_analysis=False):
-    if not 5 <= maximum <= 15 or not 5 <= target <= maximum:
-        raise ValueError("首版测试范围：5 ≤ 目标时长 ≤ 最长时长 ≤ 15 秒。")
+    maximum, target = float(maximum), float(target)
+    if not MIN_ANALYSIS_SECONDS <= target <= maximum:
+        raise ValueError("目标时长必须不小于 5 秒，且不超过最长时长；单段时长不设 15 秒上限。")
     starts, db = envelope(audio, sr)
     transcript = audit_asr_transcript(transcript, len(audio)/sr)
     all_lines = transcript.get("segments", [])
