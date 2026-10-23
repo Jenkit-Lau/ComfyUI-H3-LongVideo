@@ -1535,6 +1535,48 @@ def request_regeneration(row, reason):
     row.pop("regeneration_reason", None)
 
 
+def update_limits(plan, max_seconds=UNSET, target_seconds=UNSET):
+    """Change the per-segment duration caps without re-cutting the timeline.
+
+    The panel drags, the end-time input and the merge check all read
+    plan["max_seconds"], so a project analysed under the old 15s default stays
+    stuck at 15s until this value is raised here.
+    """
+    def resolve(value, key):
+        if value is UNSET:
+            stored = plan.get(key)
+            if stored is None:
+                raise ValueError("项目缺少时长参数，请重新分析音频。")
+            return float(stored)
+        if value is None or str(value).strip() == "":
+            raise ValueError("时长不能为空。")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("时长必须是数字。") from exc
+        if not math.isfinite(number):
+            raise ValueError("时长必须是有效数字。")
+        return number
+
+    maximum = resolve(max_seconds, "max_seconds")
+    target = resolve(target_seconds, "target_seconds")
+    if not MIN_ANALYSIS_SECONDS <= target <= maximum:
+        raise ValueError("要求 5 ≤ 目标时长 ≤ 最长时长。")
+    if maximum > MAX_SEGMENT_SECONDS:
+        raise ValueError(f"最长时长最多 {MAX_SEGMENT_SECONDS:g} 秒。")
+    sr = float(plan["sample_rate"])
+    longest = max(((int(row["end_sample"]) - int(row["start_sample"])) / sr
+                   for row in plan["segments"]), default=0.0)
+    if longest > maximum + 1e-6:
+        raise ValueError(
+            f"已有一段长 {longest:.2f} 秒，最长时长不能低于它；请先缩短那段再调小上限。")
+    if (maximum, target) == (float(plan["max_seconds"]), float(plan["target_seconds"])):
+        return plan
+    plan.update(max_seconds=maximum, target_seconds=target,
+                revision=int(plan.get("revision", 0)) + 1)
+    return plan
+
+
 def edit_plan(plan, submitted, directory=None, reference_default_count=UNSET, materials=UNSET):
     if plan.get("run_status") in {"running", "pausing", "stopping", "merging"}:
         raise ValueError("请等当前任务停止后再修改分段。")

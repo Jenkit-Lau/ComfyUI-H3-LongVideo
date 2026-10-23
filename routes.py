@@ -13,7 +13,7 @@ from .core import (LOCK, REFERENCE_MIRROR_ROOT, UNSET, archive_take, audio_file,
                    output_preview, project_path, read_plan, read_project_transcript,
                    preview_segment_brief, reference_directory, remove_reference, remove_segment,
                    request_regeneration, segmentation, split_segment,
-                   state_file, store_reference, write_plan)
+                   state_file, store_reference, update_limits, write_plan)
 from .nodes import data_root, final_root, rules_path, storage_root
 
 RANGE_HEADER = re.compile(r"\s*bytes=(\d*)-(\d*)\s*")
@@ -377,6 +377,20 @@ def register_routes():
             transcript, _ = read_project_transcript(project_path(root, pid), plan)
             plan = remove_segment(plan, payload.get("index"))
             refresh_segment_text(plan, transcript)
+            write_plan(root, plan)
+        return web.json_response(plan)
+
+    @routes.post("/h3lv/project/{project_id}/limits")
+    @endpoint
+    async def limits(request):
+        payload = await request.json()
+        root, pid = data_root(), request.match_info["project_id"]
+        with LOCK:
+            plan = read_plan(root, pid)
+            if int(payload.get("revision", -1)) != plan["revision"]:
+                raise ValueError("方案已被另一个窗口修改，请刷新。")
+            plan = update_limits(plan, payload.get("max_seconds", UNSET),
+                                 payload.get("target_seconds", UNSET))
             write_plan(root, plan)
         return web.json_response(plan)
 

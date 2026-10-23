@@ -578,6 +578,15 @@ function statusText(plan) {
 }
 
 async function openReview(owner) {
+  // 状态与项目列表必须在建 DOM 之前就绪：面板一插入 body 就能点“关闭”，
+  // 若此时还停在 await 上，回调里的 dirty/canvas 会撞上 let/const 的 TDZ。
+  let plan = null;
+  let analysis = null;
+  let rows = [];
+  let details = [];
+  let dirty = false;
+  let selected = 0;
+  let projects = await request("/h3lv/projects");
   const previous = document.getElementById("h3lv-panel");
   previous?.querySelector("canvas")?.disposeTimeline?.();
   previous?.remove();
@@ -609,7 +618,6 @@ async function openReview(owner) {
   const projectRow = element("div", undefined, header, "h3lv-project-row");
   const selectLabel = element("label", "分析项目", projectRow);
   const select = element("select", undefined, selectLabel);
-  let projects = await request("/h3lv/projects");
   function populateProjects(preferredId = select.value) {
     select.replaceChildren();
     for (const project of projects) {
@@ -669,6 +677,63 @@ async function openReview(owner) {
 
   const status = element("div", "", header, "h3lv-status");
   const controls = element("div", undefined, header, "h3lv-actions");
+  // 上限与 core.MAX_SEGMENT_SECONDS 保持一致；后端会再校验一次，这里只作输入提示。
+  const LIMIT_CEILING = 149;
+  const limitRow = element("div", undefined, header, "h3lv-limit-row");
+  const maxLimitLabel = element("label", "单段上限（秒）", limitRow);
+  const maxLimitInput = document.createElement("input");
+  maxLimitInput.type = "number"; maxLimitInput.step = ".1";
+  maxLimitInput.min = "5"; maxLimitInput.max = String(LIMIT_CEILING);
+  maxLimitLabel.append(maxLimitInput);
+  const targetLimitLabel = element("label", "目标时长（秒）", limitRow);
+  const targetLimitInput = document.createElement("input");
+  targetLimitInput.type = "number"; targetLimitInput.step = ".1";
+  targetLimitInput.min = "5"; targetLimitInput.max = String(LIMIT_CEILING);
+  targetLimitLabel.append(targetLimitInput);
+  const limitHint = element("span", "", limitRow, "h3lv-limit-hint");
+
+  // 控件必须全部建好后再绑定 handler 与状态同步，否则会撞上 const 的 TDZ。
+  function syncLimitControls() {
+    const ready = Boolean(plan?.segments?.length);
+    limitRow.hidden = !ready;
+    if (!ready) return;
+    maxLimitInput.value = String(plan.max_seconds ?? 15);
+    targetLimitInput.value = String(plan.target_seconds ?? plan.max_seconds ?? 15);
+    limitHint.textContent = `当前单段最长 ${plan.max_seconds ?? 15} 秒；改大后即可把切点拖到更长，`
+      + `不会重切已有分段（最多 ${LIMIT_CEILING} 秒）。`;
+  }
+
+  async function applyLimits() {
+    if (!plan) return;
+    const maxSeconds = Number(maxLimitInput.value);
+    const targetSeconds = Number(targetLimitInput.value);
+    try {
+      if (!Number.isFinite(maxSeconds) || !Number.isFinite(targetSeconds))
+        throw new Error("时长必须是数字。");
+      // 切点可能有未保存的改动，先落盘再改参数，避免版本号冲突。
+      const revision = await saveDraft();
+      plan = await request(endpoint("/limits"),
+        {revision, max_seconds:maxSeconds, target_seconds:targetSeconds});
+      // 同步节点参数，免得下次“重新分析分段”又回到 15 秒。
+      for (const [name, value] of [["max_seconds", maxSeconds], ["target_seconds", targetSeconds]]) {
+        const nodeWidget = owner.widgets?.find(item => item.name === name);
+        if (nodeWidget) nodeWidget.value = value;
+      }
+      owner.setDirtyCanvas?.(true, true);
+      await load();
+      toast("单段时长已更新",
+        `单段上限 ${plan.max_seconds} 秒，目标 ${plan.target_seconds} 秒；现在可以把切点拖到 ${plan.max_seconds} 秒。`,
+        "success");
+    } catch (error) {
+      syncLimitControls();
+      throw error;
+    }
+  }
+
+  const limitFailed = error => toast("时长未修改", String(error?.message || error), "error");
+  maxLimitInput.onchange = () => applyLimits().catch(limitFailed);
+  targetLimitInput.onchange = () => applyLimits().catch(limitFailed);
+
   const content = element("main", undefined, panel, "h3lv-content");
   const overview = element("section", undefined, content, "h3lv-overview");
   element("p", "先看整曲切点和风险，再逐段试听。调整完成后保存并确认；在生成工作流中点击绿色按钮启动完整循环。", overview, "h3lv-help");
@@ -695,12 +760,6 @@ async function openReview(owner) {
   const defaultMaterials = element("details", undefined, content, "h3lv-default-materials");
   let defaultEditor = null;
   const segmentsBody = element("section", undefined, content, "h3lv-segments");
-  let plan = null;
-  let analysis = null;
-  let rows = [];
-  let details = [];
-  let dirty = false;
-  let selected = 0;
   const endpoint = (suffix = "") => `/h3lv/project/${encodeURIComponent(select.value)}${suffix}`;
   const state = () => ({plan, analysis, rows, selected});
   const MIN_SEGMENT_SECONDS = 1;
@@ -762,11 +821,22 @@ async function openReview(owner) {
       item.generationFrames.textContent = `${generationFrames} 生成帧`;
     });
   }
+  let capHintAt = 0;
+  function hintCapReached() {
+    const now = Date.now();
+    if (now - capHintAt < 4000) return;
+    capHintAt = now;
+    toast("已到单段上限",
+      `当前单段最长 ${plan.max_seconds} 秒；在面板上方把“单段上限”改大即可继续拖长。`, "warn");
+  }
   function moveBoundary(index, proposed) {
     const start = index === 0 ? 0 : Number(rows[index-1].end.value);
     const nextEnd = Number(rows[index+1].end.value);
     const lower = Math.max(start+3, nextEnd-plan.max_seconds);
     const upper = Math.min(start+plan.max_seconds, nextEnd-3);
+    // 只有被 max_seconds 挡住才提示，被相邻段 3 秒下限挡住时不提。
+    if (proposed > upper+1e-6 && Math.abs(upper-(start+plan.max_seconds)) < 1e-6) hintCapReached();
+    if (proposed < lower-1e-6 && Math.abs(lower-(nextEnd-plan.max_seconds)) < 1e-6) hintCapReached();
     rows[index].end.value = Math.max(lower, Math.min(upper, proposed)).toFixed(3);
     refreshDraftDisplays();
     markDirty();
@@ -1132,6 +1202,7 @@ async function openReview(owner) {
     if (!select.value) {
       status.textContent = "还没有分析项目，请先运行 H3 音频分析节点。";
       notice.textContent = "没有可审核的项目。";
+      limitRow.hidden = true;
       return;
     }
     plan = await request(endpoint());
@@ -1140,6 +1211,7 @@ async function openReview(owner) {
         segments:plan.segments.map(row => ({...row, reference_source:row.refs?.length ? "custom" : "default"}))});
     }
     syncDefaultReferenceControl();
+    syncLimitControls();
     const defaultOpen = defaultMaterials.open;
     defaultMaterials.replaceChildren();
     const defaultHeader = element("summary", undefined, defaultMaterials, "h3lv-default-materials-header");
