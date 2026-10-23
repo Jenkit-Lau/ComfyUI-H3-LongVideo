@@ -318,6 +318,13 @@
   background: #252c35; color: #edf1f7;
 }
 .h3lv-shot-control-help { color: #aeb8c6; font-size: 12px; }
+.h3lv-segment-structure {
+  margin-top: 14px; padding: 10px 12px; align-items: center;
+  border: 1px dashed #414c5b; border-radius: 7px; background: #151b22;
+}
+.h3lv-segment-structure .segment-split { border-color: #3f7fbf; color: #cfe6ff; }
+.h3lv-segment-structure .segment-remove { border-color: #8b4448; color: #ffd2d5; background: #3a2226; }
+.h3lv-segment-structure .segment-remove:hover { border-color: #b8565c; background: #472a2e; }
 .h3lv-prompt-actions { margin-top: 10px; }
 .h3lv-direct-prompt {
   margin-top: 12px; border: 1px solid #425563; border-radius: 7px; background: #151b22;

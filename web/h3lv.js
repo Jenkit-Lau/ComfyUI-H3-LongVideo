@@ -442,6 +442,28 @@ function needsReplacement(row) {
   return Boolean(row.needs_regeneration && row.job?.status === "completed" && row.job?.video);
 }
 
+// Wide-to-tight order matches the 景别 dropdown in the review panel.
+const SHOT_SIZES = [
+  ["full shot", "全身景（头顶至双脚完整入画）"],
+  ["medium shot", "中景（腰部以上）"],
+  ["medium close-up", "中近景（胸部以上）"],
+  ["close-up", "近景（头部与肩部）"],
+];
+
+function shotSizeFromBrief(text) {
+  const line = String(text || "").split("\n").find(item => item.trim().startsWith("开场构图"));
+  if (!line) return "";
+  const body = line.slice(line.indexOf("：")+1).trim().slice(0, 60);
+  const matched = [...SHOT_SIZES].sort((a, b) => b[1].length-a[1].length)
+    .find(([, label]) => body.includes(label));
+  return matched ? matched[0] : "";
+}
+
+function shotSizeShort(key) {
+  const found = SHOT_SIZES.find(item => item[0] === key);
+  return found ? found[1].split("（")[0] : "";
+}
+
 function outputPreviewUrl(preview) {
   const query = new URLSearchParams({
     filename: preview.filename,
@@ -681,6 +703,7 @@ async function openReview(owner) {
   let selected = 0;
   const endpoint = (suffix = "") => `/h3lv/project/${encodeURIComponent(select.value)}${suffix}`;
   const state = () => ({plan, analysis, rows, selected});
+  const MIN_SEGMENT_SECONDS = 1;
 
   function markDirty() {
     dirty = true;
@@ -771,6 +794,8 @@ async function openReview(owner) {
       const time = element("span", `${row.start.toFixed(3)}—${row.end.toFixed(3)}s`, main, "h3lv-time");
       const duration = element("span", `${row.duration.toFixed(3)}s`, main, "h3lv-duration");
       element("span", row.reason || "未标注切点原因", summary, "h3lv-reason");
+      const summaryShot = row.shot_size_manual || row.shot_size || shotSizeFromBrief(row.prompt);
+      if (summaryShot) element("span", shotSizeShort(summaryShot), summary, "h3lv-chip neutral");
       if (needsReplacement(row)) element("span", "待重生成", summary, "h3lv-chip risk");
       else if (row.job?.status) element("span", row.job.status, summary, "h3lv-chip neutral");
       card.ontoggle = () => {
@@ -942,10 +967,56 @@ async function openReview(owner) {
         element("span", `音频判断：${audioHint}。选择后会立即重写本段导演简报；人物氛围和空镜不会使用人声参考。`,
           shotControl, "h3lv-shot-control-help");
       }
-      const promptActions = element("div", undefined, inner, "h3lv-actions h3lv-prompt-actions");
+      // 导演简报的隐藏承载字段；景别控件会先于它写入，因此提前声明。
       const prompt = document.createElement("textarea");
-      prompt.value = row.prompt || "";
       let promptEdited = false;
+      const framingControl = element("div", undefined, inner, "h3lv-shot-control");
+      const framingLabel = element("label", "本段景别", framingControl);
+      const framingSelect = element("select", undefined, framingLabel);
+      for (const [value, label] of SHOT_SIZES) {
+        const option = element("option", label, framingSelect);
+        option.value = value;
+      }
+      const framing = {manual: row.shot_size_manual || ""};
+      const automaticFraming = () => shotSizeFromBrief(row.prompt) || row.shot_size ||
+        (plan.mode === "speaking" ? plan.director?.rule_config?.speaking?.framing || "" : "");
+      framingSelect.value = framing.manual || automaticFraming();
+      const framingHint = element("span", "", framingControl, "h3lv-shot-control-help");
+      const framingReset = actionButton(framingControl, "恢复自动", () => applyShotSize(""),
+        "reference-copy");
+      function syncFramingHint() {
+        framingHint.textContent = framing.manual
+          ? "已锁定该景别。保存后按它重写本段及后续分段的导演简报，开场构图会跟着改。"
+          : "默认读取本段导演简报“开场构图”的景别；下拉可覆盖并写入导演简报。";
+        framingReset.hidden = !framing.manual;
+      }
+      async function applyShotSize(value) {
+        const shown = framingSelect.value;
+        framingSelect.disabled = true;
+        try {
+          const result = await request(endpoint("/brief-preview"), {revision:plan.revision,
+            index:row.index,
+            visual_type:visualTypeSelect ? visualTypeSelect.value : (row.visual_type || "performance"),
+            shot_size:value});
+          framing.manual = value;
+          framingSelect.value = value || shotSizeFromBrief(result.prompt)
+            || automaticFraming() || shown;
+          prompt.value = result.prompt;
+          promptEdited = false;
+          syncFramingHint();
+          markDirty();
+        } catch (error) {
+          framingSelect.value = shown;
+          await messageDialog({title:"景别更新失败", message:error.message || String(error), tone:"error"});
+        } finally {
+          framingSelect.disabled = false;
+        }
+      }
+      framingSelect.onchange = () => applyShotSize(framingSelect.value);
+      framingReset.hidden = true;
+      syncFramingHint();
+      const promptActions = element("div", undefined, inner, "h3lv-actions h3lv-prompt-actions");
+      prompt.value = row.prompt || "";
       prompt.oninput = () => {promptEdited = true; markDirty();};
       if (visualTypeSelect) {
         let currentVisualType = visualTypeSelect.value;
@@ -992,8 +1063,36 @@ async function openReview(owner) {
       finalPrompt.placeholder = "粘贴或输入本段要直接发送给 H3 的提示词。插件不扩写、不校验、不回退。";
       finalPrompt.spellcheck = false;
       finalPrompt.oninput = markDirty;
+      const structure = element("div", undefined, inner, "h3lv-actions h3lv-segment-structure");
+      element("span", "分段结构", structure, "h3lv-audio-label");
+      actionButton(structure, "＋ 拆分本段", async () => {
+        const start = Number(row.start);
+        const stop = Number(end.value);
+        const middle = Math.round((start+stop)/2*1000)/1000;
+        if (stop-start < 2*MIN_SEGMENT_SECONDS) throw new Error(
+          `本段只有 ${(stop-start).toFixed(2)} 秒，拆分后每段至少需要 ${MIN_SEGMENT_SECONDS} 秒。`);
+        if (!await confirmDialog({
+          title: `在第 ${row.index+1} 段中间新增一个分段？`,
+          message: `会在 ${middle.toFixed(3)}s 插入新切点，把本段一分为二；两段都会重算导演简报，参考图沿用本段。`
+            + "\n\n保存后可以用卡片里的结束时间或波形拖动新切点。",
+          confirmText: "插入切点",
+        })) return;
+        await applyStructureChange("/split", {index: row.index, time: middle});
+      }, "segment-split");
+      actionButton(structure, "删除本段", async () => {
+        if (plan.segments.length <= 1) throw new Error("至少需要保留一个分段。");
+        if (!await confirmDialog({
+          title: `删除第 ${row.index+1} 段？`,
+          message: "删除后这一段的时长会并入相邻分段，原曲仍然完整覆盖；合并后超过最长时长的分段不能删除。",
+          confirmText: "删除并合并",
+          tone: "warning",
+        })) return;
+        await applyStructureChange("/remove", {index: row.index});
+      }, "segment-remove");
+      element("span", "新增分段等于在本段中间插入一个切点；删除分段会并入相邻分段，原曲不会被截断。",
+        structure, "h3lv-shot-control-help");
       rows.push({end, prompt, finalPrompt, note, materialControls, visualType:visualTypeSelect,
-        refs: rowRefs, renderRefs: renderReferences, duration, time,
+        shotSize:() => framing.manual, refs: rowRefs, renderRefs: renderReferences, duration, time,
         generationFrames, editFrames, audio:segmentAudio});
       details.push(card);
       const resultControls = element("div", undefined, resultPanel || inner, "h3lv-result-controls");
@@ -1103,6 +1202,13 @@ async function openReview(owner) {
     }
   }
 
+  async function applyStructureChange(path, body) {
+    // 增删分段由服务端重排序列，先把未保存的切点和简报落盘。
+    const revision = await saveDraft();
+    await request(endpoint(path), {revision, ...body});
+    await load();
+  }
+
   async function saveDraft() {
     let revision = plan.revision;
     if (dirty) {
@@ -1111,6 +1217,7 @@ async function openReview(owner) {
         ...(plan.materials_version ? {materials:{refs:defaultEditor.refs, note:defaultEditor.getNote()}} : {}),
         segments: rows.map(row => ({end: Number(row.end.value), prompt: row.prompt.value,
           final_prompt: row.finalPrompt.value,
+          shot_size: row.shotSize ? row.shotSize() : "",
           material_note: row.materialControls ? row.materialControls.getNote() : row.note.value, refs: row.refs,
           ...(row.materialControls ? {reference_source:row.materialControls.source.value,
             visual_type:row.visualType.value, brief_matches_visual_type:true} : {})}))});
